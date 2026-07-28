@@ -1,0 +1,248 @@
+#include <Wire.h>
+#include <DHT.h>
+#include <RTClib.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#define SDA_PIN 8
+#define SCL_PIN 9
+#define DHT_PIN 4
+#define DHT_TYPE DHT22
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_ADDRESS 0x3C
+
+const unsigned long SENSOR_INTERVAL_MS = 2000;
+const unsigned long DISPLAY_INTERVAL_MS = 80;
+const unsigned long WORKING_TIMEOUT_MS = 75000;
+const unsigned long DONE_SCREEN_MS = 8000;
+
+DHT dht(DHT_PIN, DHT_TYPE);
+RTC_DS3231 rtc;
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+enum ScreenState { IDLE, WORKING, WAITING, DONE, ERROR_STATE };
+ScreenState screenState = IDLE;
+
+char taskLabel[29] = "READY";
+char serialLine[96];
+uint8_t serialIndex = 0;
+float temperature = NAN;
+float humidity = NAN;
+unsigned long lastSensorRead = 0;
+unsigned long lastDisplayDraw = 0;
+unsigned long stateStartedAt = 0;
+unsigned long lastStateSignalAt = 0;
+
+void copyAscii(char *destination, const char *source, size_t destinationSize) {
+  size_t target = 0;
+  while (*source && target < destinationSize - 1) {
+    char character = *source++;
+    if (character >= 32 && character <= 126) {
+      destination[target++] = character;
+    }
+  }
+  destination[target] = '\0';
+  if (target == 0) {
+    snprintf(destination, destinationSize, "HERMES TASK");
+  }
+}
+
+void setScreenState(ScreenState newState, const char *newLabel) {
+  unsigned long now = millis();
+  if (screenState != newState) {
+    stateStartedAt = now;
+  }
+  screenState = newState;
+  lastStateSignalAt = now;
+  copyAscii(taskLabel, newLabel, sizeof(taskLabel));
+}
+
+void handleStatusLine(char *line) {
+  char *prefix = strtok(line, "|");
+  char *state = strtok(NULL, "|");
+  char *label = strtok(NULL, "|");
+  if (prefix == NULL || state == NULL || strcmp(prefix, "STATE") != 0) {
+    return;
+  }
+  if (label == NULL) {
+    label = "HERMES TASK";
+  }
+
+  if (strcmp(state, "IDLE") == 0) setScreenState(IDLE, label);
+  else if (strcmp(state, "WORKING") == 0) setScreenState(WORKING, label);
+  else if (strcmp(state, "WAITING") == 0) setScreenState(WAITING, label);
+  else if (strcmp(state, "DONE") == 0) setScreenState(DONE, label);
+  else if (strcmp(state, "ERROR") == 0) setScreenState(ERROR_STATE, label);
+}
+
+void readSerialStatus() {
+  while (Serial.available() > 0) {
+    char character = (char)Serial.read();
+    if (character == '\r') continue;
+    if (character == '\n') {
+      serialLine[serialIndex] = '\0';
+      handleStatusLine(serialLine);
+      serialIndex = 0;
+    } else if (serialIndex < sizeof(serialLine) - 1) {
+      serialLine[serialIndex++] = character;
+    } else {
+      serialIndex = 0;
+    }
+  }
+}
+
+void drawSensorLine() {
+  display.setTextSize(1);
+  display.setCursor(2, 54);
+  if (isnan(temperature) || isnan(humidity)) {
+    display.print("SENSOR CHECK");
+    return;
+  }
+  display.print(temperature, 1);
+  display.print("C  ");
+  display.print(humidity, 1);
+  display.print("%");
+}
+
+void drawIdleScreen() {
+  DateTime now = rtc.now();
+  char timeText[10];
+  char dateText[16];
+  snprintf(timeText, sizeof(timeText), "%02d:%02d", now.hour(), now.minute());
+  snprintf(dateText, sizeof(dateText), "%04d-%02d-%02d", now.year(), now.month(), now.day());
+
+  display.setTextSize(3);
+  display.setCursor(15, 0);
+  display.print(timeText);
+  display.setTextSize(1);
+  display.setCursor(30, 28);
+  display.print(dateText);
+  display.drawFastHLine(0, 40, 128, SSD1306_WHITE);
+  drawSensorLine();
+  display.setCursor(86, 42);
+  display.print("HERMES");
+  display.drawCircle(118, 46, 3, SSD1306_WHITE);
+}
+
+void drawSpinner(unsigned long now) {
+  uint8_t frame = (now / 140) % 8;
+  int8_t xOffsets[] = {0, 4, 6, 4, 0, -4, -6, -4};
+  int8_t yOffsets[] = {-6, -4, 0, 4, 6, 4, 0, -4};
+  display.drawCircle(116, 12, 8, SSD1306_WHITE);
+  display.fillCircle(116 + xOffsets[frame], 12 + yOffsets[frame], 2, SSD1306_WHITE);
+}
+
+void drawWorkingScreen(unsigned long now) {
+  display.setTextSize(1);
+  display.setCursor(2, 2);
+  display.print("HERMES");
+  drawSpinner(now);
+
+  display.setTextSize(2);
+  display.setCursor(2, 17);
+  display.print("WORKING");
+  display.setTextSize(1);
+  display.setCursor(2, 37);
+  display.print(taskLabel);
+
+  uint8_t segments = (now / 180) % 10;
+  display.drawRect(2, 47, 124, 4, SSD1306_WHITE);
+  display.fillRect(3, 48, segments * 12, 2, SSD1306_WHITE);
+  drawSensorLine();
+}
+
+void drawWaitingScreen(unsigned long now) {
+  bool visible = ((now / 500) % 2) == 0;
+  display.setTextSize(1);
+  display.setCursor(2, 2);
+  display.print("HERMES");
+  display.setTextSize(2);
+  display.setCursor(2, 17);
+  display.print("WAITING");
+  if (visible) {
+    display.setTextSize(3);
+    display.setCursor(103, 0);
+    display.print("?");
+  }
+  display.setTextSize(1);
+  display.setCursor(2, 42);
+  display.print(taskLabel);
+  drawSensorLine();
+}
+
+void drawDoneScreen() {
+  display.drawRoundRect(43, 2, 42, 36, 5, SSD1306_WHITE);
+  display.drawLine(52, 19, 62, 28, SSD1306_WHITE);
+  display.drawLine(62, 28, 77, 10, SSD1306_WHITE);
+  display.setTextSize(2);
+  display.setCursor(16, 42);
+  display.print("COMPLETE");
+  display.setTextSize(1);
+  display.setCursor(26, 55);
+  display.print(taskLabel);
+}
+
+void drawErrorScreen(unsigned long now) {
+  bool visible = ((now / 500) % 2) == 0;
+  display.drawTriangle(54, 2, 75, 2, 64, 23, SSD1306_WHITE);
+  if (visible) {
+    display.setTextSize(2);
+    display.setCursor(60, 4);
+    display.print("!");
+  }
+  display.setTextSize(1);
+  display.setCursor(11, 31);
+  display.print("TASK NEEDS CHECK");
+  display.setCursor(2, 43);
+  display.print(taskLabel);
+  drawSensorLine();
+}
+
+void drawScreen(unsigned long now) {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  if (screenState == IDLE) drawIdleScreen();
+  else if (screenState == WORKING) drawWorkingScreen(now);
+  else if (screenState == WAITING) drawWaitingScreen(now);
+  else if (screenState == DONE) drawDoneScreen();
+  else drawErrorScreen(now);
+  display.display();
+}
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(SDA_PIN, SCL_PIN);
+  dht.begin();
+
+  if (!rtc.begin()) {
+    while (true) delay(10);
+  }
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDRESS)) {
+    while (true) delay(10);
+  }
+  stateStartedAt = millis();
+  lastStateSignalAt = millis();
+}
+
+void loop() {
+  unsigned long now = millis();
+  readSerialStatus();
+
+  if (now - lastSensorRead >= SENSOR_INTERVAL_MS) {
+    lastSensorRead = now;
+    humidity = dht.readHumidity();
+    temperature = dht.readTemperature();
+  }
+  if (screenState == WORKING && now - lastStateSignalAt > WORKING_TIMEOUT_MS) {
+    setScreenState(IDLE, "READY");
+  }
+  if (screenState == DONE && now - stateStartedAt > DONE_SCREEN_MS) {
+    setScreenState(IDLE, "READY");
+  }
+  if (now - lastDisplayDraw >= DISPLAY_INTERVAL_MS) {
+    lastDisplayDraw = now;
+    drawScreen(now);
+  }
+}
